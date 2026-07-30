@@ -43,7 +43,9 @@ The single `__interrupt()` ISR handles four sources:
 - **IOCBF2** — flow-meter pulse counting
 - **RCIF** — UART RX byte accumulation with frame detection
 - **TMR0IF** — 1-second tick for flow-rate calculation and LED heartbeat
-- **TMR2IF** — 1 ms tick used as inter-character timeout for Modbus frame end detection
+- **TMR2IF** — 1 ms tick used as inter-character timeout for Modbus frame end detection, and to drive the non-blocking settle/pacing countdowns below
+
+Modbus requests are sent via `modbus_tx_start()` / polled via `modbus_tx_poll()`, which track the response wait and a `MODBUS_SETTLE_MS` post-response settle window without blocking. `main()`'s loop is an explicit state sequencer (HMI read → optional flow-cal ack → HMI write → optional MXMT/FDMT write → repeat) that advances one step per pass, polling whichever transaction is in flight instead of stalling on it. `thermo_sens_update()` runs opportunistically between steps, rate-limited to >=10 ms apart to respect the ADS1118's minimum conversion interval.
 
 ## Modbus Register Map
 
@@ -133,9 +135,7 @@ All three function codes (FC03 read, FC06 write-single, FC10 write-multiple) hav
 
 ## Watchdog Timer
 
-The WDT is enabled in config bits. `CLRWDT()` is called:
-- At the top of the main loop
-- Inside `modbus_wait_fr_end()` on every iteration, preventing a WDT reset during the up-to-500 ms Modbus wait
+The WDT is enabled in config bits. `CLRWDT()` is called once per main-loop pass, at the top of the loop. Since Modbus transactions are non-blocking (see Software Architecture above), the loop never stalls waiting on one, so this single call is sufficient — there is no separate blocking wait routine to guard.
 
 ## Build
 

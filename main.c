@@ -74,6 +74,7 @@ static const unsigned short tc_step_uV[TC_NUM_SEGS] = {
 #define FDMT_STA_NO             0x3
 #define MXMT_STA_NO             0x2
 #define MT_OP_FREQ_ADDR         0x1000
+#define MODBUS_SETTLE_MS        60          //post-response bus/slave settle window (1ms ticks)
 
 //MCU write to HMI info - txdata
 #define FLOWRATE_IDX            0           //LW11
@@ -327,6 +328,7 @@ int main(int argc, char** argv)
                 break;
 
             case SEQ_FLCALI_START:
+                pending_flcali = 0;    //consume the one-shot trigger now, so a later failed read can't re-arm it
                 modbus_tx_start(HMI_STA_NO,SING_REG_WR_CMD,HMI_RD_START_ADDR +FL_CALIPUL_RD_IDX,1,txdata +FL_CALI_PUL_IDX);
                 seq = SEQ_FLCALI_WAIT;
                 break;
@@ -597,7 +599,7 @@ unsigned char modbus_tx_poll(void)
             if(calc_crc != recv_crc)
                 rxdata_ready_flag = 0;
         }
-        settle_cnt = 60;
+        settle_cnt = MODBUS_SETTLE_MS;
         settle_armed = 1;
         return 0;
     }
