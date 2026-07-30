@@ -123,8 +123,8 @@ void thermo_sens_update(void);
 void thermo_sens_init(void);
 unsigned short volt_temp_lookup(unsigned short, short);
 static unsigned short temp_to_uV(unsigned short);
-void modbus_master_send(unsigned char , unsigned char , unsigned short , unsigned short , volatile unsigned short *);
-void modbus_wait_fr_end(void);
+void modbus_tx_start(unsigned char , unsigned char , unsigned short , unsigned short , volatile unsigned short *);
+unsigned char modbus_tx_poll(void);
 unsigned short modbusCRC16(const unsigned char *, unsigned short );
 
 
@@ -140,6 +140,17 @@ volatile unsigned char  rsp_type = 0,
                         fr_rx_flag = 0,
                         fl_pulse_cali_flag = 0;
 volatile unsigned short timeout_cnt = 0;
+
+/* Non-blocking Modbus transaction timing (1ms ticks, decremented in the
+ * TMR2 ISR). settle_cnt replaces the old fixed __delay_ms(60) post-response
+ * delay; thermo_due_cnt paces thermo_sens_update() so it isn't called
+ * faster than the ADS1118's ~7.8ms (128 SPS) minimum conversion interval,
+ * now that the main loop can call it many times while a transaction is
+ * in flight instead of once per (previously blocking) pass. */
+volatile unsigned short settle_cnt = 0,
+                        thermo_due_cnt = 0;
+static unsigned char   mb_busy = 0,
+                        settle_armed = 0;
 
 /* Cached thermocouple calibration offsets. Updated only from a confirmed
  * complete, CRC-valid rxdata[] frame (see the rxdata_ready_flag block in
@@ -220,80 +231,150 @@ int main(int argc, char** argv)
     //txdata = ??
 //    modbus_master_send(HMI_STA_NO,MULT_REG_WR_CMD,HMI_WR_START_ADDR,MODBUS_WRBUF_LEN,txdata);
    
+    typedef enum {
+        SEQ_HMI_READ_START, SEQ_HMI_READ_WAIT,
+        SEQ_FLCALI_START,   SEQ_FLCALI_WAIT,
+        SEQ_HMI_WRITE_START,SEQ_HMI_WRITE_WAIT,
+        SEQ_MXMT_START,     SEQ_MXMT_WAIT,
+        SEQ_FDMT_START,     SEQ_FDMT_WAIT
+    } main_seq_t;
+
+    main_seq_t seq = SEQ_HMI_READ_START;
+    unsigned char pending_flcali = 0;
+
     while(1)
     {
         CLRWDT();
-        
-        modbus_master_send(HMI_STA_NO,MULT_REG_RD_CMD,HMI_RD_START_ADDR,MODBUS_RDBUF_LEN,0);
-        thermo_sens_update();
 
-        if(rxdata_ready_flag)
+        if(0 == thermo_due_cnt)
         {
-            txdata[ERRCODE_IDX] &= ~(1 << ERRCODE_ERR0_BIT);
-
-            PORTAbits.RA0 = (rxdata[3+ STACODE_RD_IDX*2 +1 -STACODE_MXMTSS_BIT/8] & (1<< STACODE_MXMTSS_BIT%8))? 1: 0;
-            PORTAbits.RA1 = (rxdata[3+ STACODE_RD_IDX*2 +1 -STACODE_FDMTSS_BIT/8] & (1<< STACODE_FDMTSS_BIT%8))? 1: 0;
-
-            PORTAbits.RA4 = (rxdata[3+ STACODE_RD_IDX*2 +1 -STACODE_VALVIN_BIT/8] & (1<< STACODE_VALVIN_BIT%8))? 1: 0;
-            PORTCbits.RC2 = (rxdata[3+ STACODE_RD_IDX*2 +1 -STACODE_VALVOT_BIT/8] & (1<< STACODE_VALVOT_BIT%8))? 1: 0;
-
-            if(!(rxdata[3+ STACODE_RD_IDX*2 +1 -STACODE_HTCTR_BIT/8] & (1<< STACODE_HTCTR_BIT%8)))
-            {
-                PORTAbits.RA2 = (rxdata[3+ STACODE_RD_IDX*2 +1 -STACODE_HEATCO1_BIT/8] & (1<< STACODE_HEATCO1_BIT%8))? 1: 0;
-                PORTAbits.RA3 = (rxdata[3+ STACODE_RD_IDX*2 +1 -STACODE_HEATCO2_BIT/8] & (1<< STACODE_HEATCO2_BIT%8))? 1: 0;
-            }
-            else
-            {
-                PORTAbits.RA2 = (((rxdata[3+ TRGT_TEMP_IDX *2] <<8) | rxdata[3+ TRGT_TEMP_IDX *2 +1]) > txdata[T1_MEAS_IDX])? 1:0;
-                PORTAbits.RA3 = (((rxdata[3+ TRGT_TEMP_IDX *2] <<8) | rxdata[3+ TRGT_TEMP_IDX *2 +1]) > txdata[T2_MEAS_IDX])? 1:0;
-            }
-
-            if(rxdata[3+ STACODE_RD_IDX*2 +1 -STACODE_FLCALI_BIT/8] & (1<< STACODE_FLCALI_BIT%8))
-            {
-                if(0 == fl_pulse_cali_flag)
-                {
-                    fl_pulse_cali_flag = 1;
-                    txdata[FL_CALI_PUL_IDX] = 0;
-                }
-            }
-            else
-            {
-                if(fl_pulse_cali_flag)
-                {
-                    fl_pulse_cali_flag = 0;
-                    modbus_master_send(HMI_STA_NO,SING_REG_WR_CMD,HMI_RD_START_ADDR +FL_CALIPUL_RD_IDX,1,txdata +FL_CALI_PUL_IDX);
-                }
-            }
-
-            if((rxdata[3+ VOL_CALIPUL_RD_IDX *2] <<8) | rxdata[3+ VOL_CALIPUL_RD_IDX *2 +1])
-                fl_pulse_litre = (((unsigned long)rxdata[3+ FL_CALIPUL_RD_IDX *2] <<8) | rxdata[3+ FL_CALIPUL_RD_IDX *2 +1]) *1000 / (((unsigned short)rxdata[3+ VOL_CALIPUL_RD_IDX *2] <<8) | rxdata[3+ VOL_CALIPUL_RD_IDX *2 +1]);
-
-            txdata[STACODE_IDX] = (PORTAbits.RA0 <<STACODE_MXMTSS_BIT) |
-                                  (PORTAbits.RA1 <<STACODE_FDMTSS_BIT) |
-                                  (PORTAbits.RA2 <<STACODE_HEATCO1_BIT) |
-                                  (PORTAbits.RA3 <<STACODE_HEATCO2_BIT) |
-                                  (PORTAbits.RA4 <<STACODE_VALVIN_BIT) |
-                                  (PORTCbits.RC2 <<STACODE_VALVOT_BIT);
-            txdata[FDMT_FREQ_IDX] = (unsigned short)(rxdata[3+ FDMT_FREQ_RD_IDX *2] <<8)| rxdata[3+ FDMT_FREQ_RD_IDX *2 +1];
-            txdata[MXMT_FREQ_IDX] = (unsigned short)(rxdata[3+ MXMT_FREQ_RD_IDX *2] <<8)| rxdata[3+ MXMT_FREQ_RD_IDX *2 +1];
-
-            t1_cali = (short)(((unsigned short)rxdata[3+ T1_CALI_IDX *2] <<8) | rxdata[3+ T1_CALI_IDX *2 +1]);
-            t2_cali = (short)(((unsigned short)rxdata[3+ T2_CALI_IDX *2] <<8) | rxdata[3+ T2_CALI_IDX *2 +1]);
-            t3_cali = (short)(((unsigned short)rxdata[3+ T3_CALI_IDX *2] <<8) | rxdata[3+ T3_CALI_IDX *2 +1]);
+            thermo_sens_update();
+            thermo_due_cnt = 10;    //>7.8ms ADS1118 min conversion interval @128SPS
         }
-        else
+
+        switch(seq)
         {
-            txdata[ERRCODE_IDX] |= (1 << ERRCODE_ERR0_BIT);
+            case SEQ_HMI_READ_START:
+                modbus_tx_start(HMI_STA_NO,MULT_REG_RD_CMD,HMI_RD_START_ADDR,MODBUS_RDBUF_LEN,0);
+                seq = SEQ_HMI_READ_WAIT;
+                break;
+
+            case SEQ_HMI_READ_WAIT:
+                if(!modbus_tx_poll())
+                    break;
+
+                if(rxdata_ready_flag)
+                {
+                    txdata[ERRCODE_IDX] &= ~(1 << ERRCODE_ERR0_BIT);
+
+                    PORTAbits.RA0 = (rxdata[3+ STACODE_RD_IDX*2 +1 -STACODE_MXMTSS_BIT/8] & (1<< STACODE_MXMTSS_BIT%8))? 1: 0;
+                    PORTAbits.RA1 = (rxdata[3+ STACODE_RD_IDX*2 +1 -STACODE_FDMTSS_BIT/8] & (1<< STACODE_FDMTSS_BIT%8))? 1: 0;
+
+                    PORTAbits.RA4 = (rxdata[3+ STACODE_RD_IDX*2 +1 -STACODE_VALVIN_BIT/8] & (1<< STACODE_VALVIN_BIT%8))? 1: 0;
+                    PORTCbits.RC2 = (rxdata[3+ STACODE_RD_IDX*2 +1 -STACODE_VALVOT_BIT/8] & (1<< STACODE_VALVOT_BIT%8))? 1: 0;
+
+                    if(!(rxdata[3+ STACODE_RD_IDX*2 +1 -STACODE_HTCTR_BIT/8] & (1<< STACODE_HTCTR_BIT%8)))
+                    {
+                        PORTAbits.RA2 = (rxdata[3+ STACODE_RD_IDX*2 +1 -STACODE_HEATCO1_BIT/8] & (1<< STACODE_HEATCO1_BIT%8))? 1: 0;
+                        PORTAbits.RA3 = (rxdata[3+ STACODE_RD_IDX*2 +1 -STACODE_HEATCO2_BIT/8] & (1<< STACODE_HEATCO2_BIT%8))? 1: 0;
+                    }
+                    else
+                    {
+                        PORTAbits.RA2 = (((rxdata[3+ TRGT_TEMP_IDX *2] <<8) | rxdata[3+ TRGT_TEMP_IDX *2 +1]) > txdata[T1_MEAS_IDX])? 1:0;
+                        PORTAbits.RA3 = (((rxdata[3+ TRGT_TEMP_IDX *2] <<8) | rxdata[3+ TRGT_TEMP_IDX *2 +1]) > txdata[T2_MEAS_IDX])? 1:0;
+                    }
+
+                    pending_flcali = 0;
+                    if(rxdata[3+ STACODE_RD_IDX*2 +1 -STACODE_FLCALI_BIT/8] & (1<< STACODE_FLCALI_BIT%8))
+                    {
+                        if(0 == fl_pulse_cali_flag)
+                        {
+                            fl_pulse_cali_flag = 1;
+                            txdata[FL_CALI_PUL_IDX] = 0;
+                        }
+                    }
+                    else
+                    {
+                        if(fl_pulse_cali_flag)
+                        {
+                            fl_pulse_cali_flag = 0;
+                            pending_flcali = 1;
+                        }
+                    }
+
+                    if((rxdata[3+ VOL_CALIPUL_RD_IDX *2] <<8) | rxdata[3+ VOL_CALIPUL_RD_IDX *2 +1])
+                        fl_pulse_litre = (((unsigned long)rxdata[3+ FL_CALIPUL_RD_IDX *2] <<8) | rxdata[3+ FL_CALIPUL_RD_IDX *2 +1]) *1000 / (((unsigned short)rxdata[3+ VOL_CALIPUL_RD_IDX *2] <<8) | rxdata[3+ VOL_CALIPUL_RD_IDX *2 +1]);
+
+                    txdata[STACODE_IDX] = (PORTAbits.RA0 <<STACODE_MXMTSS_BIT) |
+                                          (PORTAbits.RA1 <<STACODE_FDMTSS_BIT) |
+                                          (PORTAbits.RA2 <<STACODE_HEATCO1_BIT) |
+                                          (PORTAbits.RA3 <<STACODE_HEATCO2_BIT) |
+                                          (PORTAbits.RA4 <<STACODE_VALVIN_BIT) |
+                                          (PORTCbits.RC2 <<STACODE_VALVOT_BIT);
+                    txdata[FDMT_FREQ_IDX] = (unsigned short)(rxdata[3+ FDMT_FREQ_RD_IDX *2] <<8)| rxdata[3+ FDMT_FREQ_RD_IDX *2 +1];
+                    txdata[MXMT_FREQ_IDX] = (unsigned short)(rxdata[3+ MXMT_FREQ_RD_IDX *2] <<8)| rxdata[3+ MXMT_FREQ_RD_IDX *2 +1];
+
+                    t1_cali = (short)(((unsigned short)rxdata[3+ T1_CALI_IDX *2] <<8) | rxdata[3+ T1_CALI_IDX *2 +1]);
+                    t2_cali = (short)(((unsigned short)rxdata[3+ T2_CALI_IDX *2] <<8) | rxdata[3+ T2_CALI_IDX *2 +1]);
+                    t3_cali = (short)(((unsigned short)rxdata[3+ T3_CALI_IDX *2] <<8) | rxdata[3+ T3_CALI_IDX *2 +1]);
+                }
+                else
+                {
+                    txdata[ERRCODE_IDX] |= (1 << ERRCODE_ERR0_BIT);
+                }
+
+                seq = pending_flcali? SEQ_FLCALI_START : SEQ_HMI_WRITE_START;
+                break;
+
+            case SEQ_FLCALI_START:
+                modbus_tx_start(HMI_STA_NO,SING_REG_WR_CMD,HMI_RD_START_ADDR +FL_CALIPUL_RD_IDX,1,txdata +FL_CALI_PUL_IDX);
+                seq = SEQ_FLCALI_WAIT;
+                break;
+
+            case SEQ_FLCALI_WAIT:
+                if(modbus_tx_poll())
+                    seq = SEQ_HMI_WRITE_START;
+                break;
+
+            case SEQ_HMI_WRITE_START:
+                modbus_tx_start(HMI_STA_NO,MULT_REG_WR_CMD,HMI_WR_START_ADDR,MODBUS_WRBUF_LEN,txdata);
+                seq = SEQ_HMI_WRITE_WAIT;
+                break;
+
+            case SEQ_HMI_WRITE_WAIT:
+                if(!modbus_tx_poll())
+                    break;
+
+                if(PORTAbits.RA0)
+                    seq = SEQ_MXMT_START;
+                else if(PORTAbits.RA1)
+                    seq = SEQ_FDMT_START;
+                else
+                    seq = SEQ_HMI_READ_START;
+                break;
+
+            case SEQ_MXMT_START:
+                modbus_tx_start(MXMT_STA_NO,SING_REG_WR_CMD,MT_OP_FREQ_ADDR,1,txdata +MXMT_FREQ_IDX);
+                seq = SEQ_MXMT_WAIT;
+                break;
+
+            case SEQ_MXMT_WAIT:
+                if(!modbus_tx_poll())
+                    break;
+
+                seq = PORTAbits.RA1? SEQ_FDMT_START : SEQ_HMI_READ_START;
+                break;
+
+            case SEQ_FDMT_START:
+                modbus_tx_start(FDMT_STA_NO,SING_REG_WR_CMD,MT_OP_FREQ_ADDR,1,txdata +FDMT_FREQ_IDX);
+                seq = SEQ_FDMT_WAIT;
+                break;
+
+            case SEQ_FDMT_WAIT:
+                if(modbus_tx_poll())
+                    seq = SEQ_HMI_READ_START;
+                break;
         }
-        
-        modbus_master_send(HMI_STA_NO,MULT_REG_WR_CMD,HMI_WR_START_ADDR,MODBUS_WRBUF_LEN,txdata);
-        
-        if(PORTAbits.RA0)
-            modbus_master_send(MXMT_STA_NO,SING_REG_WR_CMD,MT_OP_FREQ_ADDR,1,txdata +MXMT_FREQ_IDX);
-        
-        if(PORTAbits.RA1)
-            modbus_master_send(FDMT_STA_NO,SING_REG_WR_CMD,MT_OP_FREQ_ADDR,1,txdata +FDMT_FREQ_IDX);
-        
     }
     return (EXIT_SUCCESS);
 }
@@ -384,7 +465,13 @@ void __interrupt() isr(void)
     if (PIE1bits.TMR2IE && PIR1bits.TMR2IF)
     {
         PIR1bits.TMR2IF = 0;
-        
+
+        if(settle_cnt)
+            settle_cnt -= 1;
+
+        if(thermo_due_cnt)
+            thermo_due_cnt -= 1;
+
         if(timeout_cnt)
         {
             timeout_cnt -= 1;
@@ -416,12 +503,15 @@ void __interrupt() isr(void)
     }
 }
 
-void modbus_master_send(unsigned char sta_id, unsigned char func, unsigned short addr, unsigned short reg_cnt, volatile unsigned short *data)
+/* Builds and transmits one Modbus RTU request, then arms the async
+ * wait/settle tracked by modbus_tx_poll(). Non-blocking except for the
+ * frame transmission itself (<1ms for these frame sizes at 115200 baud). */
+void modbus_tx_start(unsigned char sta_id, unsigned char func, unsigned short addr, unsigned short reg_cnt, volatile unsigned short *data)
 {
     unsigned char data_buff[33] = {sta_id,func,addr>>8,addr&0xff,0,0, 0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0},
                   fr_len = 0;
     unsigned short crc = 0;
-    
+
     switch(func)
     {
         case 0x6:       //write single register
@@ -429,7 +519,7 @@ void modbus_master_send(unsigned char sta_id, unsigned char func, unsigned short
                 return;
             data_buff[4] = *data >>8;
             data_buff[5] = *data &0xff;
- 
+
             crc = modbusCRC16(data_buff,6);
             data_buff[6] = crc &0xff;
             data_buff[7] = crc >>8;
@@ -442,13 +532,13 @@ void modbus_master_send(unsigned char sta_id, unsigned char func, unsigned short
             data_buff[4] = reg_cnt >>8;
             data_buff[5] = reg_cnt &0xff;
             data_buff[6] = reg_cnt <<1;
-            
+
             for(unsigned char i=0;i<reg_cnt;++i)
             {
                 data_buff[7 +2*i] = *(data +i) >>8;
-                data_buff[8 +2*i] = *(data +i) &0xff;  
+                data_buff[8 +2*i] = *(data +i) &0xff;
             }
-            
+
             crc = modbusCRC16(data_buff,7+(reg_cnt<<1));
             data_buff[7+(reg_cnt<<1)] = crc &0xff;
             data_buff[7+(reg_cnt<<1) +1] = crc >>8;
@@ -460,7 +550,7 @@ void modbus_master_send(unsigned char sta_id, unsigned char func, unsigned short
 //                return;
             data_buff[4] = reg_cnt >>8;
             data_buff[5] = reg_cnt &0xff;
-            
+
             crc = modbusCRC16(data_buff,6);
             data_buff[6] = crc &0xff;
             data_buff[7] = crc >>8;
@@ -468,9 +558,9 @@ void modbus_master_send(unsigned char sta_id, unsigned char func, unsigned short
             rsp_fr_len = 3+ (reg_cnt<<1) +2;
             break;
         default:
-            break;
+            return;
     }
-    
+
     rxdata_ready_flag = 0;
 
     for(unsigned char i=0;i<fr_len;++i)
@@ -478,23 +568,46 @@ void modbus_master_send(unsigned char sta_id, unsigned char func, unsigned short
 
     rsp_type = func;
     timeout_cnt = 500;
-    modbus_wait_fr_end();
-
-    if(rxdata_ready_flag && rsp_fr_len >= 2)
-    {
-        unsigned short calc_crc = modbusCRC16(rxdata, rsp_fr_len - 2);
-        unsigned short recv_crc = (unsigned short)rxdata[rsp_fr_len-2] |
-                                  ((unsigned short)rxdata[rsp_fr_len-1] << 8);
-        if(calc_crc != recv_crc)
-            rxdata_ready_flag = 0;
-    }
-
-    __delay_ms(60);
+    settle_armed = 0;
+    mb_busy = 1;
 }
 
-void modbus_wait_fr_end(void)
+/* Polls the transaction armed by modbus_tx_start(). Returns 1 once both
+ * the response wait (or timeout) and the post-response settle window have
+ * completed, 0 while still busy. Returns 1 immediately if no transaction
+ * is in flight (including when modbus_tx_start() rejected its arguments
+ * and never armed one), matching the old modbus_master_send()'s no-op
+ * early-return behavior. Call every main-loop pass; other work (e.g.
+ * thermo_sens_update()) can run freely in between calls while busy. */
+unsigned char modbus_tx_poll(void)
 {
-    while(timeout_cnt) CLRWDT();
+    if(!mb_busy)
+        return 1;
+
+    if(timeout_cnt)
+        return 0;
+
+    if(!settle_armed)
+    {
+        if(rxdata_ready_flag && rsp_fr_len >= 2)
+        {
+            unsigned short calc_crc = modbusCRC16(rxdata, rsp_fr_len - 2);
+            unsigned short recv_crc = (unsigned short)rxdata[rsp_fr_len-2] |
+                                      ((unsigned short)rxdata[rsp_fr_len-1] << 8);
+            if(calc_crc != recv_crc)
+                rxdata_ready_flag = 0;
+        }
+        settle_cnt = 60;
+        settle_armed = 1;
+        return 0;
+    }
+
+    if(settle_cnt)
+        return 0;
+
+    mb_busy = 0;
+    settle_armed = 0;
+    return 1;
 }
 
 /* Forward (temp→voltage) lookup used for cold-junction compensation.
