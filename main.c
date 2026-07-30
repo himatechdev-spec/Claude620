@@ -141,6 +141,13 @@ volatile unsigned char  rsp_type = 0,
                         fl_pulse_cali_flag = 0;
 volatile unsigned short timeout_cnt = 0;
 
+/* Cached thermocouple calibration offsets. Updated only from a confirmed
+ * complete, CRC-valid rxdata[] frame (see the rxdata_ready_flag block in
+ * main()), so thermo_sens_update() never applies a torn/partial read. */
+short t1_cali = 0,
+      t2_cali = 0,
+      t3_cali = 0;
+
 int main(int argc, char** argv) 
 {  
 //    unsigned char modbus_task_id = HMI_STA_NO;
@@ -269,6 +276,10 @@ int main(int argc, char** argv)
                                   (PORTCbits.RC2 <<STACODE_VALVOT_BIT);
             txdata[FDMT_FREQ_IDX] = (unsigned short)(rxdata[3+ FDMT_FREQ_RD_IDX *2] <<8)| rxdata[3+ FDMT_FREQ_RD_IDX *2 +1];
             txdata[MXMT_FREQ_IDX] = (unsigned short)(rxdata[3+ MXMT_FREQ_RD_IDX *2] <<8)| rxdata[3+ MXMT_FREQ_RD_IDX *2 +1];
+
+            t1_cali = (short)(((unsigned short)rxdata[3+ T1_CALI_IDX *2] <<8) | rxdata[3+ T1_CALI_IDX *2 +1]);
+            t2_cali = (short)(((unsigned short)rxdata[3+ T2_CALI_IDX *2] <<8) | rxdata[3+ T2_CALI_IDX *2 +1]);
+            t3_cali = (short)(((unsigned short)rxdata[3+ T3_CALI_IDX *2] <<8) | rxdata[3+ T3_CALI_IDX *2 +1]);
         }
         else
         {
@@ -307,42 +318,47 @@ void __interrupt() isr(void)
         }
     }
     
-    if (PIE1bits.RCIE && PIR1bits.RCIF) 
+    if (PIE1bits.RCIE && PIR1bits.RCIF)
     {
-        if (1 == RCSTAbits.OERR)
+        unsigned char oerr_now = (1 == RCSTAbits.OERR);
+
+        if (oerr_now)
         {
             RCSTAbits.CREN = 0;
             RCSTAbits.CREN = 1;
+            dummy = RCREG;      //discard the indeterminate byte flushed by the CREN reset
             fr_rx_flag = 0;     //abandon the corrupted in-progress frame
             rx_idx = 0;
         }
-
-        if((fr_rx_flag == 0) && timeout_cnt)
+        else if((fr_rx_flag == 0) && timeout_cnt)
         {
             fr_rx_flag = 1;
             rx_idx = 0;
         }
 
-        if(fr_rx_flag)
+        if(!oerr_now)
         {
-            timeout_cnt = 1;
-
-            TMR2 = 0;
-            PIR1bits.TMR2IF = 0;
-
-            if(rx_idx < sizeof(rxdata))
+            if(fr_rx_flag)
             {
-                rxdata[rx_idx] = RCREG;
-                rx_idx += 1;
+                timeout_cnt = 1;
+
+                TMR2 = 0;
+                PIR1bits.TMR2IF = 0;
+
+                if(rx_idx < sizeof(rxdata))
+                {
+                    rxdata[rx_idx] = RCREG;
+                    rx_idx += 1;
+                }
+                else
+                {
+                    dummy = RCREG;
+                }
             }
             else
             {
                 dummy = RCREG;
             }
-        }
-        else
-        {
-            dummy = RCREG;
         }
     }
 
@@ -361,10 +377,7 @@ void __interrupt() isr(void)
             }
             fl_pulse = 0;
         
-            if(!PORTBbits.RB7)
-//                PORTBbits.RB7 = 0;
-//            else
-                PORTBbits.RB7 = 1;
+            PORTBbits.RB7 = !PORTBbits.RB7;    //blink heartbeat, ~1 Hz
         }
     }
     
@@ -567,7 +580,7 @@ void thermo_sens_update(void)
                                         0b01 <<1 |
                                         0b0         );            
             PORTCbits.RC1 = 1;
-            txdata[T2_MEAS_IDX] = volt_temp_lookup(adc_val,txdata[TCJ_A_IDX]) +((short)(rxdata[3+ T2_CALI_IDX *2] <<8) | rxdata[3+ T2_CALI_IDX *2 +1]);
+            txdata[T2_MEAS_IDX] = volt_temp_lookup(adc_val,txdata[TCJ_A_IDX]) + t2_cali;
  
             PORTCbits.RC0 = 0;
             adc_val = spi_wr_rd_byte(   0b1  <<7 |
@@ -596,7 +609,7 @@ void thermo_sens_update(void)
                                         0b01 <<1 |
                                         0b0         );            
             PORTCbits.RC1 = 1;
-            txdata[T1_MEAS_IDX] = volt_temp_lookup(adc_val,txdata[TCJ_A_IDX]) +((short)(rxdata[3+ T1_CALI_IDX *2] <<8) | rxdata[3+ T1_CALI_IDX *2 +1]);
+            txdata[T1_MEAS_IDX] = volt_temp_lookup(adc_val,txdata[TCJ_A_IDX]) + t1_cali;
 
             PORTCbits.RC0 = 0;
             adc_val = spi_wr_rd_byte(   0b1  <<7 |
@@ -609,7 +622,7 @@ void thermo_sens_update(void)
                                         0b01 <<1 |
                                         0b0         );            
             PORTCbits.RC0 = 1;
-            txdata[T3_MEAS_IDX] = volt_temp_lookup(adc_val,txdata[TCJ_B_IDX]) +((short)(rxdata[3+ T3_CALI_IDX *2] <<8) | rxdata[3+ T3_CALI_IDX *2 +1]);
+            txdata[T3_MEAS_IDX] = volt_temp_lookup(adc_val,txdata[TCJ_B_IDX]) + t3_cali;
        
             ch_num = 0;
             break;
